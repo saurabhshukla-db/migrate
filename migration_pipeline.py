@@ -1,3 +1,5 @@
+# Databricks notebook source
+
 import os.path
 from datetime import datetime
 from pipeline import Pipeline
