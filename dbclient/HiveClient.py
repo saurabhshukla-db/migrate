@@ -102,7 +102,8 @@ class HiveClient(ClustersClient):
         # check if the database location / path is the default DBFS path
         table_name = os.path.basename(local_table_path)
         is_db_default_path = db_path.startswith('dbfs:/user/hive/warehouse')
-        if (not is_db_default_path) and (not self.is_table_location_defined(local_table_path)):
+        ddl_statement = self.get_ddl_by_keyword_group(local_table_path)
+        if (not is_db_default_path) and (not self.is_table_location_defined(local_table_path)) and (not self.is_ddl_a_view(ddl_statement)):
             # the LOCATION attribute is not defined and the Database has a custom location defined
             # therefore we need to add it to the DDL, e.g. dbfs:/db_path/table_name
             table_path = db_path + '/' + table_name
@@ -377,7 +378,7 @@ class HiveClient(ClustersClient):
                 logging.info(all_db_details_json)
                 raise ValueError('Missing Database Attributes Log. Re-run metastore export')
             create_db_resp = self.create_database_db(db_name, ec_id, cid, database_attributes)
-            if logging_utils.log_reponse_error(error_logger, create_db_resp):
+            if logging_utils.log_response_error(error_logger, create_db_resp):
                 logging.error(f"Failed to create database {db_name} during metastore import. Exiting Import.")
                 return
             db_path = database_attributes.get('Location')
@@ -394,7 +395,7 @@ class HiveClient(ClustersClient):
                         if not self.move_table_view(db_name, tbl_name, local_table_ddl):
                             # we hit a table ddl here, so we apply the ddl
                             resp = self.apply_table_ddl(local_table_ddl, ec_id, cid, db_path, has_unicode)
-                            if not logging_utils.log_reponse_error(error_logger, resp):
+                            if not logging_utils.log_response_error(error_logger, resp):
                                 checkpoint_metastore_set.write(full_table_name)
                         else:
                             logging.info(f'Moving view ddl to re-apply later: {db_name}.{tbl_name}')
@@ -414,7 +415,7 @@ class HiveClient(ClustersClient):
                         logging.info(f"Importing view {full_view_name}")
                         local_view_ddl = metastore_view_dir + db_name + '/' + view_name
                         resp = self.apply_table_ddl(local_view_ddl, ec_id, cid, db_path, has_unicode)
-                        if logging_utils.log_reponse_error(error_logger, resp):
+                        if logging_utils.log_response_error(error_logger, resp):
                             checkpoint_metastore_set.write(full_view_name)
                         logging.info(resp)
 
@@ -428,7 +429,7 @@ class HiveClient(ClustersClient):
         # DBR 7.0 changes databaseName to namespace for the return value of show databases
         all_dbs_cmd = 'all_dbs = [x.databaseName for x in spark.sql("show databases").collect()]; print(len(all_dbs))'
         results = self.submit_command(cid, ec_id, all_dbs_cmd)
-        if logging_utils.log_reponse_error(error_logger, results):
+        if logging_utils.log_response_error(error_logger, results):
             raise ValueError("Cannot identify number of databases due to the above error")
         num_of_dbs = ast.literal_eval(results['data'])
         batch_size = 100    # batch size to iterate over databases
@@ -510,12 +511,12 @@ class HiveClient(ClustersClient):
         if ddl_len > 2048 or has_unicode:
             # create the dbfs tmp path for exports / imports. no-op if exists
             resp = self.post('/dbfs/mkdirs', {'path': '/tmp/migration/'})
-            if logging_utils.log_reponse_error(error_logger, resp):
+            if logging_utils.log_response_error(error_logger, resp):
                 return False
             # save the ddl to the tmp path on dbfs
             save_ddl_cmd = "with open('/dbfs/tmp/migration/tmp_export_ddl.txt', 'w') as fp: fp.write(ddl_str)"
             save_resp = self.submit_command(cid, ec_id, save_ddl_cmd)
-            if logging_utils.log_reponse_error(error_logger, save_resp):
+            if logging_utils.log_response_error(error_logger, save_resp):
                 return False
             # read that data using the dbfs rest endpoint which can handle 2MB of text easily
             read_args = {'path': '/tmp/migration/tmp_export_ddl.txt'}

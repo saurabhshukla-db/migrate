@@ -29,21 +29,37 @@ def build_pipeline(args) -> Pipeline:
         client_config = parser.build_client_config_without_profile(args)
     else:
         login_args = parser.get_login_credentials(profile=args.profile)
+
         if parser.is_azure_creds(login_args) and (not args.azure):
             raise ValueError(
                 'Login credentials do not match args. Please provide --azure flag for azure envs.')
 
+        if parser.is_gcp_creds(login_args) and (not args.gcp):
+            raise ValueError(
+                'Login credentials do not match args. Please provide --gcp flag for gcp envs.')
+
         # Cant use netrc credentials because requests module tries to load the credentials into http
         # basic auth headers parse the credentials
         url = login_args['host']
-        token = login_args['token']
+        token = login_args.get('token', login_args.get('password'))
         client_config = parser.build_client_config(args.profile, url, token, args)
 
     client_config['session'] = session
+    client_config['no_prompt'] = args.no_prompt
+
+    # list of groups to keep, if empty keep all
+    client_config['groups_to_keep'] = args.groups_to_keep
+
+    # whether to error on missing principles
+    client_config['skip_missing_users'] = args.skip_missing_users
 
     # Need to keep the export_dir as base_dir to find exported data from source and destination.
     client_config['base_dir'] = client_config['export_dir']
     client_config['export_dir'] = os.path.join(client_config['base_dir'], session) + '/'
+
+    client_config['verbose'] = args.verbose
+
+    client_config['timeout'] = args.timeout
 
     if not args.dry_run:
         os.makedirs(client_config['export_dir'], exist_ok=True)
@@ -72,7 +88,10 @@ def build_export_pipeline(client_config, checkpoint_service, args) -> Pipeline:
                                                               -> export_notebooks
                                                               -> export_metastore -> export_metastore_table_acls
     """
-    skip_tasks = args.skip_tasks
+    if args.keep_tasks:
+        skip_tasks = [task for task in wmconstants.TASK_OBJECTS if task not in args.keep_tasks]
+    else:
+        skip_tasks = args.skip_tasks
 
     source_info_file = os.path.join(client_config['export_dir'], "source_info.txt")
     with open(source_info_file, 'w') as f:
@@ -113,9 +132,11 @@ def build_import_pipeline(client_config, checkpoint_service, args) -> Pipeline:
     source_info_file = os.path.join(client_config['export_dir'], "source_info.txt")
     with open(source_info_file, 'r') as f:
         source_url = f.readline()
-        confirm = input(f"Import from `{source_url}` into `{client_config['url']}`? (y/N) ")
-        if confirm.lower() not in ["y", "yes"]:
-            raise RuntimeError("User aborted import pipeline. Exiting..")
+
+        if not client_config.get("no_prompt", None):
+            confirm = input(f"Import from `{source_url}` into `{client_config['url']}`? (y/N) ")
+            if confirm.lower() not in ["y", "yes"]:
+                raise RuntimeError("User aborted import pipeline. Exiting..")
 
     completed_pipeline_steps = checkpoint_service.get_checkpoint_key_set(
         wmconstants.WM_IMPORT, wmconstants.MIGRATION_PIPELINE_OBJECT_TYPE)
@@ -238,7 +259,7 @@ def build_validate_pipeline(client_config, checkpoint_service, args):
     #  ClustersExportTask
     add_diff_task("validate-clusters", "clusters.log", DiffConfig(
         primary_key="cluster_name",
-        ignored_keys=["cluster_id", "policy_id", "instance_pool_id", "spark_version"],
+        ignored_keys=["cluster_id", "policy_id", "instance_pool_id", "driver_instance_pool_id", "spark_version"],
         children={
             "aws_attributes": DiffConfig(
                 ignored_keys=["zone_id"]

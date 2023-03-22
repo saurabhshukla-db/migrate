@@ -183,6 +183,7 @@ class NotebookImportTask(AbstractTask):
                     'Overwrite notebooks only supports the SOURCE format. See Rest API docs for details')
         ws_c.import_all_workspace_items(archive_missing=self.args.archive_missing,
                                         num_parallel=self.client_config["num_parallel"])
+        ws_c.import_all_repos(num_parallel=self.client_config["num_parallel"])
 
 
 class ClustersExportTask(AbstractTask):
@@ -254,7 +255,11 @@ class JobsExportTask(AbstractTask):
 
     def run(self):
         jobs_c = JobsClient(self.client_config, self.checkpoint_service)
-        jobs_c.log_job_configs()
+
+        if self.client_config.get("groups_to_keep"):
+            jobs_c.log_job_configs(groups_list=self.client_config.get("groups_to_keep"))
+        else:
+            jobs_c.log_job_configs()
 
 
 class JobsImportTask(AbstractTask):

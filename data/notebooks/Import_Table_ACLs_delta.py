@@ -69,7 +69,7 @@ if not dbutils.widgets.get("InputPath").startswith("dbfs:/"):
 # COMMAND ----------
 
 # DBTITLE 1,Show Input Data
-display(spark.read.format("JSON").load(dbutils.widgets.get("InputPath")))
+display(spark.read.format("delta").load(dbutils.widgets.get("InputPath")))
 
 # COMMAND ----------
 
@@ -135,7 +135,7 @@ def execute_sql_statements(sqls):
     if sql:
       print(f"{sql};")
       try:
-        spark.sql(sql)
+#         spark.sql(sql)
         num_sucessfully_executed = num_sucessfully_executed+1
       except:
         error_causing_sqls.append({'sql': sql, 'error': sys.exc_info()})
@@ -151,7 +151,7 @@ def execute_sql_statements(sqls):
 input_path = dbutils.widgets.get("InputPath")
 
   
-table_ACLs_df = spark.read.format("JSON").load(input_path).orderBy("Database","ObjectType")
+table_ACLs_df = spark.read.format("delta").load(input_path).orderBy("Database","ObjectType")
 
 print(f"{datetime.datetime.now()} reading table ACLs from {input_path}")
 
@@ -190,12 +190,6 @@ else:
   l = [ str(o) for o in error_causing_sqls ]
   print("\n".join(l))
 
-# COMMAND ----------
-
-# DBTITLE 1,Nicer error output
-if len(error_causing_sqls) != 0:
-  l = [ {'sql': str(o.get('sql')), 'error': str(o.get('error'))} for o in error_causing_sqls ]
-  display(spark.createDataFrame(l))
 
 # COMMAND ----------
 
@@ -204,3 +198,15 @@ if len(error_causing_sqls) != 0:
 print(exit_JSON_string)
 
 dbutils.notebook.exit(exit_JSON_string) 
+
+# COMMAND ----------
+
+df = spark.read.load("dbfs:/tmp/migrate/test_table_acls_delta")
+
+# COMMAND ----------
+
+df.count()
+
+# COMMAND ----------
+
+

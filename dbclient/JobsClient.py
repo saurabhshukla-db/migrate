@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import logging_utils
@@ -9,8 +10,10 @@ class JobsClient(ClustersClient):
     def get_jobs_default_cluster_conf(self):
         if self.is_aws():
             cluster_json_file = 'data/default_jobs_cluster_aws.json'
-        else:
+        elif self.is_azure():
             cluster_json_file = 'data/default_jobs_cluster_azure.json'
+        elif self.is_gcp():
+            cluster_json_file = 'data/default_jobs_cluster_gcp.json'
         with open(cluster_json_file, 'r') as fp:
             cluster_json = json.loads(fp.read())
             return cluster_json
@@ -41,7 +44,7 @@ class JobsClient(ClustersClient):
             for job in res.get('jobs', []):
                 jobId = job.get('job_id')
                 # only replaces "real" MULTI_TASK jobs, as they contain the task definitions.
-                if jobsById[jobId].get('format') == 'MULTI_TASK':
+                if jobsById[jobId]['settings'].get('format') == 'MULTI_TASK':
                     jobsById[jobId] = job
         return jobsById.values()
 
@@ -71,22 +74,35 @@ class JobsClient(ClustersClient):
             update_args = {'job_id': job_id, 'new_settings': new_settings}
             logging.info(f'Updating job name: {update_args}')
             resp = self.post('/jobs/update', update_args)
-            if not logging_utils.log_reponse_error(error_logger, resp):
+            if not logging_utils.log_response_error(error_logger, resp):
                 checkpoint_job_configs_set.write(job_name)
             else:
                 raise RuntimeError("Import job has failed. Refer to the previous log messages to investigate.")
 
-    def log_job_configs(self, users_list=[], log_file='jobs.log', acl_file='acl_jobs.log'):
+    def log_job_configs(self, users_list=None, groups_list = None, log_file='jobs.log', acl_file='acl_jobs.log'):
         """
         log all job configs and the ACLs for each job
         :param users_list: a list of users / emails to filter the results upon (optional for group exports)
+        :param groups_list: a list of groups to filter the results upon (resolves to users)
         :param log_file: log file to store job configs as json entries per line
         :param acl_file: log file to store job ACLs
         :return:
         """
+        if users_list is None:
+            users_list = []
+
+        # if groups_to_keep is provided, get users_list based on groups_list
+        if groups_list is not None:
+            all_users = self.get('/preview/scim/v2/Users').get('Resources', None)
+            users_list = list(set([user.get("emails")[0].get("value") for user in all_users
+                                   for group in user.get("groups") if group.get("display") in groups_list]))
+
         jobs_log = self.get_export_dir() + log_file
         acl_jobs_log = self.get_export_dir() + acl_file
         error_logger = logging_utils.get_error_logger(wmconstants.WM_EXPORT, wmconstants.JOB_OBJECT, self.get_export_dir())
+        acl_error_logger = logging_utils.get_error_logger(
+            wmconstants.WM_EXPORT, wmconstants.JOB_ACL_OBJECT, self.get_export_dir()
+        )
         # pinned by cluster_user is a flag per cluster
         jl_full = self.get_jobs_list(False)
         if users_list:
@@ -104,17 +120,42 @@ class JobsClient(ClustersClient):
                 job_settings['name'] = new_job_name
                 # reset the original struct with the new settings
                 x['settings'] = job_settings
-                log_fp.write(json.dumps(x) + '\n')
-                job_perms = self.get(f'/preview/permissions/jobs/{job_id}')
-                if not logging_utils.log_reponse_error(error_logger, job_perms):
-                    job_perms['job_name'] = new_job_name
-                    acl_fp.write(json.dumps(job_perms) + '\n')
 
-    def import_job_configs(self, log_file='jobs.log', acl_file='acl_jobs.log'):
+                # get ACLs and check that the job has one owner before writing
+                job_perms = self.get(f'/preview/permissions/jobs/{job_id}')
+                if not logging_utils.log_response_error(error_logger, job_perms):
+                    valid_acl = False
+                    acls = job_perms.get("access_control_list")
+                    if acls:
+                        for acl in acls:
+                            for permission in acl.get("all_permissions"):
+                                if permission.get("permission_level") == "IS_OWNER":
+                                    valid_acl = True
+                    if valid_acl:
+                        # job and job_acl are fine, writing both to the output files
+                        log_fp.write(json.dumps(x) + '\n')
+
+                        job_perms['job_name'] = new_job_name
+                        acl_fp.write(json.dumps(job_perms) + '\n')
+                    else:
+                        # job_acl is malformed, the job is written to error output file
+                        message = f"The following job id {job_id} has malformed permissions: {json.dumps(job_perms)}"
+                        logging.error(message)
+                        logging_utils.log_response_error(acl_error_logger, {
+                            'error': message
+                        })
+                        logging_utils.log_response_error(error_logger, {
+                            'error': message, 'json': json.dumps(x)
+                        })
+
+    def import_job_configs(self, log_file='jobs.log', acl_file='acl_jobs.log', job_map_file='job_id_map.log'):
         jobs_log = self.get_export_dir() + log_file
         acl_jobs_log = self.get_export_dir() + acl_file
+        job_map_log = self.get_export_dir() + job_map_file
         error_logger = logging_utils.get_error_logger(
             wmconstants.WM_IMPORT, wmconstants.JOB_OBJECT, self.get_export_dir())
+        job_acl_error_logger = logging_utils.get_error_logger(
+            wmconstants.WM_IMPORT, wmconstants.JOB_ACL_OBJECT, self.get_export_dir())
         if not os.path.exists(jobs_log):
             logging.info("No job configurations to import.")
             return
@@ -125,6 +166,11 @@ class JobsClient(ClustersClient):
             wmconstants.WM_IMPORT, wmconstants.JOB_OBJECT)
 
         def adjust_ids_for_cluster(settings): #job_settings or task_settings
+            """
+            The task setting may have existing_cluster_id/new_cluster/job_cluster_key for cluster settings.
+            The job level setting may have existing_cluster_id/new_cluster for cluster settings.
+            Adjust cluster settings for existing_cluster_id and new_cluster scenario.
+            """
             if 'existing_cluster_id' in settings:
                 old_cid = settings['existing_cluster_id']
                 # set new cluster id for existing cluster attribute
@@ -135,7 +181,7 @@ class JobsClient(ClustersClient):
                     settings['new_cluster'] = self.get_jobs_default_cluster_conf()
                 else:
                     settings['existing_cluster_id'] = new_cid
-            else:  # new cluster config
+            elif 'new_cluster' in settings:  # new cluster config
                 cluster_conf = settings['new_cluster']
                 if 'policy_id' in cluster_conf:
                     old_policy_id = cluster_conf['policy_id']
@@ -146,8 +192,9 @@ class JobsClient(ClustersClient):
                 else:
                     new_cluster_conf = cluster_conf
                 settings['new_cluster'] = new_cluster_conf
+            return settings
 
-        with open(jobs_log, 'r') as fp:
+        with open(jobs_log, 'r') as fp, open(job_map_log, 'w') as jm_fp:
             for line in fp:
                 job_conf = json.loads(line)
                 # need to do str(...), otherwise the job_id is recognized as integer which becomes
@@ -165,17 +212,39 @@ class JobsClient(ClustersClient):
                 if 'format' not in job_settings or job_settings.get('format') == 'SINGLE_TASK':
                     adjust_ids_for_cluster(job_settings)
                 else:
+                    mod_task_settings = []
+                    for task_settings in job_settings.get('job_clusters', []):
+                        mod_task_settings.append(adjust_ids_for_cluster(task_settings))
+                    if len(mod_task_settings) > 0:
+                        job_settings['job_clusters'] = mod_task_settings
+                        mod_task_settings = []
+
+                    # multi-task jobs may have existing_cluster_id per task
                     for task_settings in job_settings.get('tasks', []):
-                        adjust_ids_for_cluster(task_settings)
+                        mod_task_settings.append(adjust_ids_for_cluster(task_settings))
+                    if len(mod_task_settings) > 0:
+                        job_settings['tasks'] = mod_task_settings
 
                 logging.info("Current Job Name: {0}".format(job_conf['settings']['name']))
                 # creator can be none if the user is no longer in the org. see our docs page
                 create_resp = self.post('/jobs/create', job_settings)
                 if logging_utils.check_error(create_resp):
                     logging.info("Resetting job to use default cluster configs due to expired configurations.")
-                    job_settings['new_cluster'] = self.get_jobs_default_cluster_conf()
+                    if job_settings.get("format", "") == "MULTI_TASK":
+
+                        # if an MTJ has a cluster that no longer exists, use the default configuration for all tasks
+                        updated_tasks = []
+                        for task in job_settings.get("tasks"):
+                            if task.get("existing_cluster_id", None):
+                                task.pop("existing_cluster_id")
+                            task["new_cluster"] = self.get_jobs_default_cluster_conf()
+                            updated_tasks.append(task)
+                        job_settings["tasks"] = updated_tasks
+                    else:
+                        job_settings['new_cluster'] = self.get_jobs_default_cluster_conf()
+
                     create_resp_retry = self.post('/jobs/create', job_settings)
-                    if not logging_utils.log_reponse_error(error_logger, create_resp_retry):
+                    if not logging_utils.log_response_error(error_logger, create_resp_retry):
                         if 'job_id' in job_conf:
                             checkpoint_job_configs_set.write(job_conf["job_id"])
                     else:
@@ -184,6 +253,8 @@ class JobsClient(ClustersClient):
                 else:
                     if 'job_id' in job_conf:
                         checkpoint_job_configs_set.write(job_conf["job_id"])
+                    _job_map = {"old_id": job_conf["job_id"], "new_id": str(create_resp["job_id"])}
+                    jm_fp.write(json.dumps(_job_map) + '\n')
 
 
         # update the jobs with their ACLs
@@ -200,12 +271,42 @@ class JobsClient(ClustersClient):
                 acl_perms = self.build_acl_args(acl_conf['access_control_list'], True)
                 acl_create_args = {'access_control_list': acl_perms}
                 acl_resp = self.patch(api, acl_create_args)
-                if not logging_utils.log_reponse_error(error_logger, acl_resp) and 'object_id' in acl_conf:
+                if not logging_utils.log_response_error(job_acl_error_logger, acl_resp) and 'object_id' in acl_conf:
                     checkpoint_job_configs_set.write(acl_conf['object_id'])
                 else:
-                    raise RuntimeError("Import job has failed. Refer to the previous log messages to investigate.")
+                    if self.is_skip_failed():
+                        logging.error(f"Skipped {acl_conf}")
+                    else:
+                        raise RuntimeError("Import job has failed. Refer to the previous log messages to investigate.")
         # update the imported job names
         self.update_imported_job_names(error_logger, checkpoint_job_configs_set)
+
+    def import_pause_status(self, log_file='jobs.log', job_map_file='job_id_map.log'):
+        log_file = self.get_export_dir() + log_file
+        job_map_file = self.get_export_dir() + job_map_file
+
+
+        if not os.path.exists(log_file) or not os.path.exists(job_map_file):
+            raise ValueError('Jobs log and jobs id map must exist to map jobs to previous existing jobs ids')
+
+        job_map_log = self._load_job_id_map(job_map_file)
+        
+        with open(log_file, 'r') as fp:
+            for line in fp:
+                job_conf = json.loads(line)
+                new_job_id = job_map_log[job_conf['job_id']]
+                job_settings = job_conf['settings']
+                update_job_conf = {'job_id': new_job_id,
+                                   'new_settings': job_settings}
+                update_job_resp = self.post('/jobs/reset', update_job_conf)
+
+    def _load_job_id_map(self, job_id_map_log):
+        id_map = {}
+        with open(job_id_map_log, 'r') as fp:
+            for single_id_map_str in fp:
+                single_id_map = json.loads(single_id_map_str)
+                id_map[single_id_map["old_id"]] = single_id_map["new_id"]
+        return id_map
 
     def pause_all_jobs(self, pause=True):
         job_list = self.get_jobs_list()

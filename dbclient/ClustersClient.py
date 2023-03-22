@@ -11,6 +11,8 @@ class ClustersClient(dbclient):
     def __init__(self, configs, checkpoint_service):
         super().__init__(configs)
         self._checkpoint_service = checkpoint_service
+        self.groups_to_keep = configs.get("groups_to_keep", False)
+        self.skip_missing_users = configs['skip_missing_users']
 
     create_configs = {'num_workers',
                       'autoscale',
@@ -29,10 +31,12 @@ class ClustersClient(dbclient):
                       'autotermination_minutes',
                       'enable_elastic_disk',
                       'instance_pool_id',
+                      'driver_instance_pool_id',
                       'policy_id',
                       'pinned_by_user_name',
                       'creator_user_name',
-                      'cluster_id'}
+                      'cluster_id',
+                      'data_security_mode'}
 
     def cleanup_cluster_pool_configs(self, cluster_json, cluster_creator, is_job_cluster=False):
         """
@@ -44,10 +48,42 @@ class ClustersClient(dbclient):
         :return:
         """
         pool_id_dict = self.get_instance_pool_id_mapping()
-        # if pool id exists, remove instance types
-        cluster_json.pop('node_type_id', None)
-        cluster_json.pop('driver_node_type_id', None)
-        cluster_json.pop('enable_elastic_disk', None)
+
+        if not pool_id_dict:
+            logging.info("WARNING: instance pool is outdated. Pools may have been deleted; cluster will use defaults.")
+            cluster_json.pop("instance_pool_id")
+        else:
+            # if pool id exists, remove instance types
+            cluster_json.pop('node_type_id', None)
+            cluster_json.pop('driver_node_type_id', None)
+            cluster_json.pop('enable_elastic_disk', None)
+            # map old pool ids to new pool ids
+            old_pool_id = cluster_json['instance_pool_id']
+            new_pool_id = pool_id_dict.get(old_pool_id)
+
+            if old_pool_id and new_pool_id:
+                cluster_json['instance_pool_id'] = new_pool_id
+            else:
+                logging.warning(
+                    f"Instance pool mapped to src/dest :{old_pool_id}/{new_pool_id} is not available." +
+                    "It may have been deleted; cluster will use defaults.")
+                cluster_json.pop("instance_pool_id")
+
+            old_driver_pool_id = cluster_json.get('driver_instance_pool_id')
+            # driver_instance_pool_id is optional. if present, try to map new id.
+            if old_driver_pool_id:
+                new_driver_pool_id = pool_id_dict.get(old_driver_pool_id)
+                if new_driver_pool_id:
+                    cluster_json['driver_instance_pool_id'] = new_driver_pool_id
+                else:
+                    # if new driver pool for respective source driver pool id is not available,
+                    # reset to default configs.
+                    logging.warning(
+                        f"Driver Instance pool mapped to src/dest :{old_driver_pool_id}/{new_driver_pool_id}" +
+                        "is not available.It may have been deleted; cluster will use defaults.")
+                    cluster_json.pop("instance_pool_id")
+                    cluster_json.pop("driver_instance_pool_id")
+
         if not is_job_cluster:
             # add custom tag for original cluster creator for cost tracking
             if 'custom_tags' in cluster_json:
@@ -62,9 +98,7 @@ class ClustersClient(dbclient):
             iam_role = aws_conf.get('instance_profile_arn', None)
             if not iam_role:
                 cluster_json['aws_attributes'] = {'instance_profile_arn': iam_role}
-        # map old pool ids to new pool ids
-        old_pool_id = cluster_json['instance_pool_id']
-        cluster_json['instance_pool_id'] = pool_id_dict[old_pool_id]
+
         return cluster_json
 
     def delete_all_clusters(self):
@@ -274,7 +308,7 @@ class ClustersClient(dbclient):
                     if 'cluster_id' in cluster_conf:
                         checkpoint_cluster_configs_set.write(cluster_conf['cluster_id'])
                 else:
-                    logging_utils.log_reponse_error(error_logger, cluster_resp)
+                    logging_utils.log_response_error(error_logger, cluster_resp)
                     print(cluster_resp)
 
         # TODO: May be put it into a separate step to make it more rerunnable.
@@ -297,9 +331,17 @@ class ClustersClient(dbclient):
                     raise ValueError(error_message)
                 api = f'/preview/permissions/clusters/{cid}'
                 resp = self.put(api, acl_args)
-                if not logging_utils.log_reponse_error(error_logger, resp):
-                    if 'object_id' in data:
-                        checkpoint_cluster_configs_set.write(data['object_id'])
+
+                if self.skip_missing_users:
+                    ignore_error_list = ["RESOURCE_DOES_NOT_EXIST", "RESOURCE_ALREADY_EXISTS"]
+                else:
+                    ignore_error_list = ["RESOURCE_ALREADY_EXISTS"]
+
+                if logging_utils.check_error(resp, ignore_error_list):
+                    logging_utils.log_response_error(error_logger, resp)
+                elif 'object_id' in data:
+                    checkpoint_cluster_configs_set.write(data['object_id'])
+
                 print(resp)
 
     def _log_cluster_ids_and_original_creators(
@@ -395,7 +437,7 @@ class ClustersClient(dbclient):
                                    'definition': policy_conf['definition']}
                     resp = self.post('/policies/clusters/create', create_args)
                     ignore_error_list = ['INVALID_PARAMETER_VALUE']
-                    if not logging_utils.log_reponse_error(error_logger, resp, ignore_error_list=ignore_error_list):
+                    if not logging_utils.log_response_error(error_logger, resp, ignore_error_list=ignore_error_list):
                         if 'policy_id' in policy_conf:
                             checkpoint_cluster_policies_set.write(policy_conf['policy_id'])
 
@@ -410,7 +452,7 @@ class ClustersClient(dbclient):
                     policy_id = id_map[p_acl['name']]
                     api = f'/permissions/cluster-policies/{policy_id}'
                     resp = self.put(api, acl_create_args)
-                    if not logging_utils.log_reponse_error(error_logger, resp):
+                    if not logging_utils.log_response_error(error_logger, resp):
                         if 'object_id' in p_acl:
                             checkpoint_cluster_policies_set.write(p_acl['object_id'])
         else:
@@ -428,7 +470,7 @@ class ClustersClient(dbclient):
                 pool_conf = json.loads(line)
                 pool_resp = self.post('/instance-pools/create', pool_conf)
                 ignore_error_list = ['INVALID_PARAMETER_VALUE']
-                logging_utils.log_reponse_error(error_logger, pool_resp, ignore_error_list=ignore_error_list)
+                logging_utils.log_response_error(error_logger, pool_resp, ignore_error_list=ignore_error_list)
 
     def import_instance_profiles(self, log_file='instance_profiles.log'):
         # currently an AWS only operation
@@ -451,8 +493,11 @@ class ClustersClient(dbclient):
                 if ip_arn not in list_of_profiles:
                     print("Importing arn: {0}".format(ip_arn))
                     resp = self.post('/instance-profiles/add', {'instance_profile_arn': ip_arn})
-                    if not logging_utils.log_reponse_error(error_logger, resp):
+                    if not logging_utils.check_error(resp):
                         import_profiles_count += 1
+                    else:
+                        logging.info(f"Failed instance profile import for {ip_arn}")
+                        logging_utils.log_response_error(error_logger, resp)
                 else:
                     logging.info("Skipping since profile already exists: {0}".format(ip_arn))
         return import_profiles_count
@@ -482,8 +527,11 @@ class ClustersClient(dbclient):
                 print("Creating cluster with: " + iam_role)
                 aws_attr['instance_profile_arn'] = iam_role
                 cluster_json['aws_attributes'] = aws_attr
-        else:
+        elif self.is_azure():
             with open(f'{real_path}/../data/azure_cluster{cluster_json_postfix}.json', 'r') as fp:
+                cluster_json = json.loads(fp.read())
+        elif self.is_gcp():
+            with open(f'{real_path}/../data/gcp_cluster{cluster_json_postfix}.json', 'r') as fp:
                 cluster_json = json.loads(fp.read())
         # set the latest spark release regardless of defined cluster json
         # cluster_json['spark_version'] = version['key']
@@ -497,7 +545,7 @@ class ClustersClient(dbclient):
             logging.info("Starting cluster with name: {0} ".format(cluster_name))
             c_info = self.post('/clusters/create', cluster_json)
             if c_info['http_status_code'] != 200:
-                raise Exception("Could not launch cluster. Verify that the --azure flag or cluster config is correct.")
+                raise Exception("Could not launch cluster. Verify that the --azure or --gcp flag or cluster config is correct.")
             self.wait_for_cluster(c_info['cluster_id'])
             return c_info['cluster_id']
 
@@ -509,6 +557,14 @@ class ClustersClient(dbclient):
         :param filter_user: user name to filter and log the cluster config
         :return:
         """
+
+        # get users list based on groups_to_keep
+        users_list = []
+        if self.groups_to_keep is not None:
+            all_users = self.get('/preview/scim/v2/Users').get('Resources', None)
+            users_list = list(set([user.get("emails")[0].get("value") for user in all_users
+                                   for group in user.get("groups") if group.get("display") in self.groups_to_keep]))
+
         cluster_log = self.get_export_dir() + log_file
         acl_cluster_log = self.get_export_dir() + acl_log_file
         error_logger = logging_utils.get_error_logger(
@@ -540,13 +596,29 @@ class ClustersClient(dbclient):
                             cluster_json['aws_attributes'] = aws_conf
                     cluster_json['aws_attributes'] = aws_conf
                 cluster_perms = self.get_cluster_acls(cluster_json['cluster_id'], cluster_json['cluster_name'])
-                if cluster_perms['http_status_code'] == 200:
+
+                if users_list:
+                    acls = [acl for acl in cluster_perms.get("access_control_list") if
+                            (acl.get("group_name", "") in self.groups_to_keep) or
+                            (acl.get("user_name", "") in users_list) or
+                            (acl.get("group_name", "") == "users")]
+                    cluster_perms["access_control_list"] = acls
+
+                    if cluster_perms['http_status_code'] == 200 and acls:
+                        acl_log_fp.write(json.dumps(cluster_perms) + '\n')
+                    else:
+                        error_logger.error(f'Failed to get cluster ACL: {cluster_perms}')
+
+                elif cluster_perms['http_status_code'] == 200:
                     acl_log_fp.write(json.dumps(cluster_perms) + '\n')
                 else:
                     error_logger.error(f'Failed to get cluster ACL: {cluster_perms}')
 
                 if filter_user:
                     if cluster_json['creator_user_name'] == filter_user:
+                        log_fp.write(json.dumps(cluster_json) + '\n')
+                elif users_list:
+                    if cluster_json.get('creator_user_name') in users_list:
                         log_fp.write(json.dumps(cluster_json) + '\n')
                 else:
                     log_fp.write(json.dumps(cluster_json) + '\n')
@@ -561,13 +633,33 @@ class ClustersClient(dbclient):
             for x in policies_list:
                 policy_ids[x.get('policy_id')] = x.get('name')
                 fp.write(json.dumps(x) + '\n')
+
+        # get users list based on groups_to_keep
+        users_list = []
+        if self.groups_to_keep is not None:
+            all_users = self.get('/preview/scim/v2/Users').get('Resources', None)
+            users_list = list(set([user.get("emails")[0].get("value") for user in all_users
+                                   for group in user.get("groups") if
+                                   group.get("display") in self.groups_to_keep]))
+
         # log cluster policy ACLs, which takes a policy id as arguments
         with open(acl_policies_log, 'w') as acl_fp:
             for pid in policy_ids:
                 api = f'/preview/permissions/cluster-policies/{pid}'
                 perms = self.get(api)
                 perms['name'] = policy_ids[pid]
-                acl_fp.write(json.dumps(perms) + '\n')
+
+                # remove any ACLs that involve users/groups that have been filtered
+                if users_list:
+                    acls = [acl for acl in perms.get("access_control_list") if
+                            (acl.get("group_name", "") in self.groups_to_keep) or
+                            (acl.get("user_name", "") in users_list) or
+                            (acl.get("group_name", "" == "users"))]
+                    if acls:
+                        perms["access_control_list"] = acls
+                        acl_fp.write(json.dumps(perms) + '\n')
+                else:
+                    acl_fp.write(json.dumps(perms) + '\n')
 
     def log_instance_pools(self, log_file='instance_pools.log'):
         pool_log = self.get_export_dir() + log_file
@@ -626,7 +718,7 @@ class ClustersClient(dbclient):
         resp = self.post('/clusters/start', {'cluster_id': cid})
         if 'error_code' in resp:
             if resp.get('error_code', None) == 'INVALID_STATE':
-                logging.error(resp.get('message', None))
+                logging.info(resp.get('message', None))
             else:
                 raise Exception('Error: cluster does not exist, or is in a state that is unexpected. '
                                 'Cluster should either be terminated state, or already running.')

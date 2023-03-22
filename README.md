@@ -7,7 +7,7 @@ to move between different cloud providers, or to move to different regions / acc
 This package is based on python 3.6 and DBR 6.x+ releases.  
 Python 3.7 or above is recommended if one is also exporting/importing MLflow objects.
 
-> **Note:** This tool does not support windows currently since path resolution is different than mac / linux.  
+> **Note:** This tool does not support windows currently since path resolution is different from mac / linux.  
 
 This package also uses credentials from the 
 [Databricks CLI](https://docs.databricks.com/user-guide/dev-tools/databricks-cli.html).
@@ -62,7 +62,7 @@ In this case oldWS is the profile name you'll refer to for running the migration
 2. `Token`: When this happens, paste in the token you generated for the old databricks account.
 
 
-Repeat the steps above for the new databricks account and change the `oldWS` profile name to something like `newWS` in order to keep track of which account you're exporting FROM and which account you're inporting TO.
+Repeat the steps above for the new databricks account and change the `oldWS` profile name to something like `newWS` in order to keep track of which account you're exporting FROM and which account you're importing TO.
 
 Create a profile for the New workspace by typing:
 
@@ -83,21 +83,22 @@ To use the migration tool see the details below to start running the tool in the
 
 Support Matrix for Import and Export Operations:
 
-| Component         | Export       | Import       |
-| ----------------- | ------------ | ------------ |
-| Users / Groups    | Supported    | Supported    |
-| Clusters (w/ ACLs)| Supported    | Supported    |
-| Notebooks         | Supported    | Supported    |
-| Notebooks ACLs    | Supported    | Supported    |
-| Metastore         | Supported    | Supported    |
-| Jobs (w/ ACLs)    | Supported    | Supported    |
-| Libraries         | Supported    | Unsupported  |
-| Secrets           | Supported    | Supported    |
-| Table ACLs        | Supported    | Supported    |
-| ML Models         | Supported*   | Supported*   |
+| Component          | Export     | Import      |
+|--------------------|------------|-------------|
+| Users / Groups     | Supported  | Supported   |
+| Clusters (w/ ACLs) | Supported  | Supported   |
+| Notebooks (w/ ACLs)| Supported  | Supported   |
+| Repos (w/ ACLs)    | Supported  | Supported*  |
+| Metastore          | Supported  | Supported   |
+| Jobs (w/ ACLs)     | Supported  | Supported   |
+| Libraries          | Supported  | Unsupported |
+| Secrets            | Supported  | Supported   |
+| Table ACLs         | Supported  | Supported   |
+| DBFS Mounts        | Supported  | Unsupported |
+| ML Models          | Supported* | Supported*  |
 
 > **Note on MLFlow Migration:**  
-> MLFlow asset migration is currently in alpha.
+> MLFlow asset migration is currently only partially supported; Feature Store and Model Registry will not be migrated, for example. See [mlflow-export-import](https://github.com/mlflow/mlflow-export-import) for comprehensive MLflow migrations.
 
 > **Note on DBFS Data Migration:**  
 > DBFS is a protected object storage location on AWS and Azure.
@@ -106,6 +107,9 @@ Support Matrix for Import and Export Operations:
 > **Note on User Migration:**  
 > During user / group import, users will be notified of the new workspace and account by default.
 > To disable this behavior, please contact your Databricks account team. 
+
+> **Note on Repos:**
+> Private repos cannot be imported. These should be added manually using the original user credentials.
 
 ---
 
@@ -117,7 +121,7 @@ The recommended method of exporting and importing is by using the Pipeline conta
 
 ```
 python migration_pipeline.py -h
-usage: migration_pipeline.py [-h] [--profile PROFILE] [--azure] [--silent] [--no-ssl-verification] [--debug] [--set-export-dir SET_EXPORT_DIR]
+usage: migration_pipeline.py [-h] [--profile PROFILE] [--azure or gcp] [--silent] [--no-ssl-verification] [--debug] [--set-export-dir SET_EXPORT_DIR]
                              [--cluster-name CLUSTER_NAME] [--notebook-format {DBC,SOURCE,HTML}] [--overwrite-notebooks] [--archive-missing]
                              [--repair-metastore-tables] [--metastore-unicode] [--skip-failed] [--session SESSION] [--dry-run] [--export-pipeline] [--import-pipeline]
                              [--validate-pipeline] [--validate-source-session VALIDATE_SOURCE_SESSION] [--validate-destination-session VALIDATE_DESTINATION_SESSION]
@@ -127,14 +131,15 @@ usage: migration_pipeline.py [-h] [--profile PROFILE] [--azure] [--silent] [--no
 
 Export user(s) workspace artifacts from Databricks
 
-optional arguments:
+optional arguments for import/export pipeline:
   -h, --help            show this help message and exit
   --profile PROFILE     Profile to parse the credentials
-  --azure               Run on Azure. (Default is AWS)
+  --azure or --gcp      Run on Azure or GCP (Default is AWS)
   --silent              Silent all logging of export operations.
   --no-ssl-verification
                         Set Verify=False when making http requests.
   --debug               Enable debug logging
+  --no-prompt           Skip interactive prompt/confirmation for workspace import.
   --set-export-dir SET_EXPORT_DIR
                         Set the base directory to export artifacts
   --cluster-name CLUSTER_NAME
@@ -148,18 +153,18 @@ optional arguments:
                         Repair legacy metastore tables
   --metastore-unicode   log all the metastore table definitions including unicode characters
   --skip-failed         Skip retries for any failed hive metastore exports.
+  --skip-missing-users  Skip failed principles during ACL import; for missing principles, this will result in open ACLs
   --session SESSION     If set, pipeline resumes from latest checkpoint of given session; Otherwise, pipeline starts from beginning and creates a new session.
   --dry-run             Dry run the pipeline i.e. will not execute tasks if true.
   --export-pipeline     Execute all export tasks.
   --import-pipeline     Execute all import tasks.
-  --validate-pipeline   Validate exported data between source and destination.
-  --validate-source-session VALIDATE_SOURCE_SESSION
-                        Session used by exporting source workspace. Only used for --validate-pipeline.
-  --validate-destination-session VALIDATE_DESTINATION_SESSION
-                        Session used by exporting destination workspace. Only used for --validate-pipeline.
   --use-checkpoint      use checkpointing to restart from previous state
-  --skip-tasks SKIP_TASKS [SKIP_TASKS ...]
-                        List of tasks to skip from the pipeline.
+  --skip-tasks SKIP_TASK [SKIP_TASK ...]
+                        Space-separated list of tasks to skip from the pipeline. Valid options are:
+                         instance_profiles, users, groups, workspace_item_log, workspace_acls, notebooks, secrets,
+                         clusters, instance_pools, jobs, metastore, metastore_table_acls, mlflow_experiments, mlflow_runs
+  --keep-tasks KEEP_TASK [KEEP_TASK ...]
+                        Space-separated list of tasks to run from the pipeline. See valid options in --skip-tasks. Overrides skip-tasks.
   --num-parallel NUM_PARALLEL
                         Number of parallel threads to use to export/import
   --retry-total RETRY_TOTAL
@@ -168,8 +173,15 @@ optional arguments:
                         Backoff factor to apply between retry attempts when making calls to Databricks API
   --start-date START_DATE
                         start-date format: YYYY-MM-DD. If not provided, defaults to past 30 days. Currently, only used for exporting ML runs objects.
-  --exclude-work-item-prefixes EXCLUDE_WORK_ITEM_PREFIXES [EXCLUDE_WORK_ITEM_PREFIXES ...]
-                        List of prefixes to skip export for log_all_workspace_items
+  --groups-to-keep group [group ...]
+                        List of groups to keep if selectively exporting assets. Only users (and their assets) belonging to these groups will be exported.
+                        
+options for validation pipeline:
+  --validate-pipeline   Validate exported data between source and destination.
+  --validate-source-session VALIDATE_SOURCE_SESSION
+                        Session used by exporting source workspace. Only used for --validate-pipeline.
+  --validate-destination-session VALIDATE_DESTINATION_SESSION
+                        Session used by exporting destination workspace. Only used for --validate-pipeline.
 ```
 
 ### Exporting the Workspace
@@ -326,7 +338,8 @@ usage: import_db.py [-h] [--users] [--workspace] [--workspace-top-level]
                     [--profile PROFILE] [--single-user SINGLE_USER]
                     [--no-ssl-verification] [--silent] [--debug]
                     [--set-export-dir SET_EXPORT_DIR] [--pause-all-jobs]
-                    [--unpause-all-jobs] [--delete-all-jobs]
+                    [--unpause-all-jobs] [--import-pause-status]
+                    [--delete-all-jobs]
                                         
 Import full workspace artifacts into Databricks
 
@@ -374,6 +387,7 @@ optional arguments:
                         export dir was a customized
   --pause-all-jobs      Pause all scheduled jobs
   --unpause-all-jobs    Unpause all scheduled jobs
+  --import-pause-status Import the pause status from jobs in the old workspace
   --delete-all-jobs     Delete all jobs
 ```
 
@@ -498,6 +512,11 @@ Un-pause all jobs in the new workspace:
 python import_db.py --profile NEW_DEMO --unpause-all-jobs
 ```
 
+If you want to unpause only the jobs which were not paused in the old workspace, you can use the following option:
+```bash
+python import_db.py --profile NEW_DEMO --import-pause-status
+```
+
 ### Hive Metastore
 
 This section uses an API to remotely run Spark commands on a cluster, this API is called 
@@ -609,11 +628,12 @@ python export_db.py --profile DEMO --secrets --cluster-name "my_cluster"
 python import_db.py --profile newDEMO --secrets
 ```
 
-### (Alpha version) Export / Import of MLFlow experiments, experiment permissions, and runs objects
+### (Alpha version) Export / Import of MLflow experiments, experiment permissions, and runs objects
 Note: Registered model, model version, and metric history are not supported yet.
+Please see [mlflow-export-import](https://github.com/amesar/mlflow-export-import) for standalone MLflow migrations.
 
-This will export and import the specified MLflow objects. Because MLFlow objects depend on other object types such as
-workspace directories, notebooks, etc this command should run after the other objects are successfully exported/imported.
+This will export and import the specified MLflow objects. Because MLflow objects depend on other object types such as
+workspace directories, notebooks, etc. this command should run after the other objects are successfully exported/imported.
 
 mlflow-runs are by default only exported for the past 30 days worth of data. The user can specify other dates but should
 be aware of the performance impacts.

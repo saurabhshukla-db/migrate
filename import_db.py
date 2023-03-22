@@ -18,9 +18,12 @@ def main():
     if is_azure_creds(login_args) and (not args.azure):
         raise ValueError('Login credentials do not match args. Please provide --azure flag for azure environments.')
 
+    if is_gcp_creds(login_args) and (not args.gcp):
+        raise ValueError('Login credentials do not match args. Please provide --gcp flag for gcp environments.')
+
     # cant use netrc credentials because requests module tries to load the credentials into http basic auth headers
     url = login_args['host']
-    token = login_args['token']
+    token = login_args.get('token', login_args.get('password'))
     client_config = build_client_config(args.profile, url, token, args)
     session = args.session if args.session else ""
     client_config['session'] = session
@@ -173,6 +176,16 @@ def main():
         jobs_c.pause_all_jobs(False)
         end = timer()
         print("Unpaused all jobs time: " + str(timedelta(seconds=end - start)))
+    
+    if args.import_pause_status:
+        print("Importing pause status for migrated jobs {0}".format(now))
+        start = timer()
+        jobs_c = JobsClient(client_config, checkpoint_service)
+        # log job configs
+        jobs_c.import_pause_status()
+        end = timer()
+        print("Import pause jobs time: " + str(timedelta(seconds=end - start)))
+
 
     if args.delete_all_jobs:
         print("Delete all current jobs {0}".format(now))
@@ -256,7 +269,7 @@ def main():
         mlflow_c = MLFlowClient(client_config, checkpoint_service)
         assert args.src_profile is not None, "Import MLflow runs requires --src-profile flag."
         src_login_args = get_login_credentials(profile=args.src_profile)
-        src_client_config = build_client_config(args.src_profile, src_login_args['host'], src_login_args['token'], args)
+        src_client_config = build_client_config(args.src_profile, src_login_args['host'], src_login_args.get('token', login_args.get('password')), args)
         mlflow_c.import_mlflow_runs(src_client_config, num_parallel=args.num_parallel)
         failed_task_log = logging_utils.get_error_log_file(wmconstants.WM_IMPORT, wmconstants.MLFLOW_RUN_OBJECT, client_config['export_dir'])
         logging_utils.raise_if_failed_task_file_exists(failed_task_log, "MLflow Runs Import.")
@@ -273,4 +286,5 @@ def main():
 
 
 if __name__ == '__main__':
+    print("Note: running import_db.py directly is not recommended. Please use migration_pipeline.py")
     main()
